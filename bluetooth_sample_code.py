@@ -87,7 +87,7 @@ class ifm_and_fm_bluetooh_functions:
             bone_name, count = bone_info[0], bone_info[1]
 
             bone_values = []
-            for _ in range(count):
+            for i in range(count):
                 if index + 1 >= len(data):
                     break
 
@@ -98,7 +98,10 @@ class ifm_and_fm_bluetooh_functions:
                 uint16 = (high_byte << 8) | low_byte
                 int16 = struct.unpack('>h', struct.pack('>H', uint16))[0]
 
-                value = int16 / 10.0
+                if bone_name == "head" and i >= 3:
+                    value = int16 / 10000.0
+                else:
+                    value = int16 / 10.0
                 bone_values.append(str(value))
 
             bone_values_str = ','.join(bone_values)
