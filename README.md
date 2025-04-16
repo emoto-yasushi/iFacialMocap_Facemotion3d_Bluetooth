@@ -15,5 +15,5 @@ When you set bluetooth_instance.message_mode="iFacialMocap", it retrieves a stri
 When you set bluetooth_instance.message_mode="Facemotion3d", it retrieves a string that takes negative values into account.
 
 
-In practice, communication using UDP results in faster and smoother performance. However, UDP can sometimes fail due to firewall or network issues. In such cases, Bluetooth can be used as an alternative. For example, it's recommended to first attempt communication via UDP, and if there is no response from the iPhone within about 0.5 seconds, switch to a Bluetooth connection.
+In practice, communication using UDP results in faster and smoother performance. However, UDP can sometimes fail due to firewall or network issues. In such cases, Bluetooth can be used as an alternative. 
 
