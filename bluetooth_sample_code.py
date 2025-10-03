@@ -184,7 +184,7 @@ class ifm_and_fm_bluetooh_functions:
     def generate_uuid_v5_from_string(self, namespace_uuid, input_string):
         namespace = uuid.UUID(namespace_uuid)
         name_bytes = input_string.encode('utf-8')
-        generated_uuid = uuid.uuid5(namespace, name_bytes.decode('utf-8'))  # uuid5はstrを引数にとる
+        generated_uuid = uuid.uuid5(namespace, name_bytes.decode('utf-8'))
 
         return str(generated_uuid)
 
@@ -195,21 +195,17 @@ class ifm_and_fm_bluetooh_functions:
         def handle_notification(sender: BleakGATTCharacteristic, data: bytearray):
             if not self.recive_bluetooth_Mode:
                 return
-
             with self.bluetooth_thread_lock:
                 self.bluetooth_received_data.extend(data)
-
                 try:
                     if self.bluetooth_received_data[0] == 0x00:
                         if len(self.bluetooth_received_data) > 3:
                             if self.encode_data_size is None:
                                 self.encode_data_size = struct.unpack(">H", self.bluetooth_received_data[1:3])[0]
-
                             if len(self.bluetooth_received_data) >= 3 + self.encode_data_size:
                                 compressed_data = self.bluetooth_received_data[3: 3 + self.encode_data_size]
                                 decoded_string = self.decompress_zlib(compressed_data, self.encode_data_size)
                                 self.decompress_json_data = json.loads(decoded_string)
-
                                 self.bluetooth_received_data = bytearray()
                                 self.encode_data_size = None
 
@@ -218,17 +214,14 @@ class ifm_and_fm_bluetooh_functions:
                             if self.encode_data_size is None:
                                 self.encode_data_size = struct.unpack(">H", self.bluetooth_received_data[1:3])[0]
                             if len(self.bluetooth_received_data) >= 3 + self.encode_data_size:
-                                message = self.values_decode_data(self.bluetooth_received_data,self.encode_data_size)
-
+                                message = self.values_decode_data(self.bluetooth_received_data, self.encode_data_size)
                                 if message is not None:
                                     try:
                                         self.recieved_message = message
                                     except queue.Full:
                                         traceback.print_exc()
-
                                 self.bluetooth_received_data = bytearray()
                                 self.encode_data_size = None
-
 
                 except Exception:
                     self.bluetooth_received_data = bytearray()
@@ -243,70 +236,54 @@ class ifm_and_fm_bluetooh_functions:
                 return
 
             for device in devices:
-                uuids = device.metadata.get("uuids", [])
-                if SERVICE_UUID.lower() in [s.lower() for s in uuids]:
-                    print(f"Connecting to: {device.name} ({device.address})")
+                uuids = getattr(device, "metadata", {}).get("uuids", []) or []
+                try_this = (SERVICE_UUID.lower() in [s.lower() for s in uuids]) or True 
 
-                    if self.bluetooth_client and self.bluetooth_client.is_connected:
-                        await self.bluetooth_send_message(message)
-                        return
+                if not try_this:
+                    continue
 
-                    client = BleakClient(device, timeout=35.0)
+                print(f"Connecting to: {device.name} ({device.address})")
+
+                if self.bluetooth_client and self.bluetooth_client.is_connected:
+                    await self.bluetooth_send_message(message)
+                    return
+
+                client = BleakClient(device, timeout=35.0)
+                try:
+                    await client.connect()
+                    await client.get_services()
+
+                    has_notify = client.services.get_characteristic(self.NOTIFY_CHARACTERISTIC_UUID) is not None
+                    has_write  = client.services.get_characteristic(self.WRITE_CHARACTERISTIC_UUID) is not None
+                    if not (has_notify and has_write):
+                        await client.disconnect()
+                        continue
+
+                    print("Successfully connected to Bluetooth.")
+                    self.bluetooth_client = client
+
+                    await client.start_notify(self.NOTIFY_CHARACTERISTIC_UUID, handle_notification)
+                    await asyncio.sleep(0.5)
+                    await self.bluetooth_send_message(message)
+
+                    self.process_message_queue()
+                    break
+
+                except Exception:
+                    self.bluetooth_stop()
+                    traceback.print_exc()
                     try:
-                        await client.connect()
-
-                        print("Successfully connected to Bluetooth.")
-                        self.bluetooth_client = client
-
-                        notify_char = None
-                        for service in client.services:
-                            for char in service.characteristics:
-                                if char.uuid.lower() == self.NOTIFY_CHARACTERISTIC_UUID.lower():
-                                    if notify_char is not None:
-                                        print(f"Warning: Multiple notify characteristics found with UUID {self.NOTIFY_CHARACTERISTIC_UUID} in different services.")
-                                    else:
-                                        notify_char = char
-                                        self.notify_char_handle = char.handle
-                                        break
-
-                        if notify_char is None:
-                            raise Exception("Notify Characteristic not found")
-
-                        write_char = None
-                        for service in client.services:
-                            for char in service.characteristics:
-                                if char.uuid.lower() == self.WRITE_CHARACTERISTIC_UUID.lower():
-                                    if write_char is not None:
-                                        pass
-                                    else:
-                                        write_char = char
-                                        self.write_char_handle = char.handle
-                                if write_char:
-                                    break
-
-                        while not self.bluetooth_connection_mode_queue.empty():
-                            self.bluetooth_connection_mode_queue.get_nowait()
-
-                        await client.start_notify(self.notify_char_handle, handle_notification)
-                        await asyncio.sleep(0.5)
-                        await self.bluetooth_send_message(message)
-
-                        self.process_message_queue()
-
-                        break
-                    except Exception as e:
-                        self.bluetooth_stop()
-                        self.stop()
-                        traceback.print_exc()
-                        traceback.print_exc()
                         if client.is_connected:
                             await client.disconnect()
-                        self.bluetooth_client = None
-        except Exception as e:
+                    except:
+                        pass
+                    self.bluetooth_client = None
+
+        except Exception:
             self.bluetooth_stop()
-            self.stop()
             traceback.print_exc()
-            
+
+                
     async def bluetooth_send_message(self, message):
         try:
             self.bluetooth_received_data.clear()
@@ -315,15 +292,17 @@ class ifm_and_fm_bluetooh_functions:
 
         if self.bluetooth_client and self.bluetooth_client.is_connected:
             try:
-                if hasattr(self, 'write_char_handle') and self.write_char_handle is not None:
-                    await self.bluetooth_client.write_gatt_char(self.write_char_handle, bytearray(message, 'utf-8'))
-                else:
-                    print(f"Write Characteristic handle not set.")
+                await self.bluetooth_client.write_gatt_char(
+                     self.WRITE_CHARACTERISTIC_UUID,
+                     bytearray(message, 'utf-8'),
+                     response=True
+                 )
             except Exception as e:
                 print(f"Error sending message: {e}")
                 traceback.print_exc()
         else:
             print("Not connected to Bluetooth device.")
+
 
     def bluetooth_send_message_trigger(self, message):
         self.recive_bluetooth_Mode = True
@@ -440,7 +419,7 @@ class ifm_and_fm_bluetooh_functions:
                 await self.bluetooth_client.disconnect()
         except Exception as e:
             print(f"Error during cleanup: {e}")
-                
+                    
     def bluetooth_stop(self):
         try:
             self.recive_bluetooth_Mode = False
@@ -448,7 +427,7 @@ class ifm_and_fm_bluetooh_functions:
             if self.bluetooth_loop and self.bluetooth_loop.is_running():
                 try:
                     future = asyncio.run_coroutine_threadsafe(self.stop_async_tasks(), self.bluetooth_loop)
-                    future.result(timeout=1.0) # タイムアウト値を調整
+                    future.result(timeout=5.0)
                 except TimeoutError:
                     print("Timeout stopping async tasks.")
                 except Exception as e:
@@ -456,7 +435,7 @@ class ifm_and_fm_bluetooh_functions:
                     traceback.print_exc()
                 try:
                     future = asyncio.run_coroutine_threadsafe(self.stop_notifications_and_cleanup(), self.bluetooth_loop)
-                    future.result(timeout=1.0) # タイムアウト値を調整
+                    future.result(timeout=5.0) 
                 except TimeoutError:
                     print("Timeout stopping notifications and cleanup.")
                 except Exception as e:
@@ -488,6 +467,7 @@ class ifm_and_fm_bluetooh_functions:
         except Exception as e:
             print(f"Error during bluetooth stop: {e}")
             traceback.print_exc()
+
 
 
 
