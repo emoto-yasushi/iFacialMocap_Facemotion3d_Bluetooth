@@ -49,6 +49,7 @@ class ifm_and_fm_bluetooh_functions:
         self.decompress_json_data = {}
         self.data_ready_event = threading.Event()
         self.recieved_message = None
+        self.keepalive_future = None
     
     def decode_blendshapes_data(self, data: bytes, index: int) -> (str, int):
         blend_shapes = self.decompress_json_data.get("blendShapes", [])
@@ -165,7 +166,6 @@ class ifm_and_fm_bluetooh_functions:
                 except:
                     traceback.print_exc()
             else:
-                traceback.print_exc()
                 return ""
         
         return f"{blend_shape_message_list}={joint_message_list}"
@@ -189,8 +189,10 @@ class ifm_and_fm_bluetooh_functions:
         return str(generated_uuid)
 
     async def bluetooth_recieve_realtime_start(self, message):
-        namespace_uuid = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
-        SERVICE_UUID = self.generate_uuid_v5_from_string(namespace_uuid, self.bluetooth_id)
+        ACCEPTED_NAMES    = {"ifacialmocap-ios", "facemotion-ios"}
+        ACCEPTED_PREFIXES = ("ifacialmocap", "facemotion")  # 将来の派生名にも強い
+        NEED_NOTIFY = self.NOTIFY_CHARACTERISTIC_UUID.lower()
+        NEED_WRITE  = self.WRITE_CHARACTERISTIC_UUID.lower()
 
         def handle_notification(sender: BleakGATTCharacteristic, data: bytearray):
             if not self.recive_bluetooth_Mode:
@@ -198,86 +200,182 @@ class ifm_and_fm_bluetooh_functions:
             with self.bluetooth_thread_lock:
                 self.bluetooth_received_data.extend(data)
                 try:
-                    if self.bluetooth_received_data[0] == 0x00:
+                    if not self.bluetooth_received_data:
+                        return
+                    head = self.bluetooth_received_data[0]
+                    if head == 0x00:
                         if len(self.bluetooth_received_data) > 3:
                             if self.encode_data_size is None:
                                 self.encode_data_size = struct.unpack(">H", self.bluetooth_received_data[1:3])[0]
                             if len(self.bluetooth_received_data) >= 3 + self.encode_data_size:
-                                compressed_data = self.bluetooth_received_data[3: 3 + self.encode_data_size]
-                                decoded_string = self.decompress_zlib(compressed_data, self.encode_data_size)
-                                self.decompress_json_data = json.loads(decoded_string)
+                                comp = self.bluetooth_received_data[3: 3 + self.encode_data_size]
+                                decoded = self.decompress_zlib(comp, self.encode_data_size)
+                                self.decompress_json_data = json.loads(decoded)
                                 self.bluetooth_received_data = bytearray()
                                 self.encode_data_size = None
-
-                    elif self.bluetooth_received_data[0] == 0x01:
+                    elif head == 0x01:
                         if len(self.bluetooth_received_data) > 3:
                             if self.encode_data_size is None:
                                 self.encode_data_size = struct.unpack(">H", self.bluetooth_received_data[1:3])[0]
                             if len(self.bluetooth_received_data) >= 3 + self.encode_data_size:
-                                message = self.values_decode_data(self.bluetooth_received_data, self.encode_data_size)
-                                if message is not None:
-                                    try:
-                                        self.recieved_message = message
-                                    except queue.Full:
-                                        traceback.print_exc()
+                                msg = self.values_decode_data(self.bluetooth_received_data, self.encode_data_size)
+                                if msg is not None:
+                                    self.recieved_message = msg
                                 self.bluetooth_received_data = bytearray()
                                 self.encode_data_size = None
-
                 except Exception:
                     self.bluetooth_received_data = bytearray()
                     self.encode_data_size = None
                     traceback.print_exc()
 
+        def _last_addr_path():
+            return os.path.join(os.path.expanduser("~"), ".ifm_last_ios_addr.txt")
+
+        def load_last_addr():
+            try:
+                with open(_last_addr_path(), "r", encoding="utf-8") as f:
+                    v = f.read().strip()
+                    return v or None
+            except Exception:
+                return None
+
+        def save_last_addr(addr: str):
+            try:
+                with open(_last_addr_path(), "w", encoding="utf-8") as f:
+                    f.write(addr or "")
+            except Exception:
+                pass
+
+        async def has_required_characteristics(c):
+            """
+            Windows対策：
+            - get_services() 後に最大2秒サービス反映待ち
+            - 直接 get_characteristic() と characteristics 総当たりの両方で確認
+            """
+            svcs = None
+            for _ in range(20):
+                try:
+                    svcs = c.services
+                    if svcs:
+                        break
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+
+            if not svcs:
+                return False
+
+            try:
+                svcs = c.services
+                if not svcs:
+                    return False
+            except Exception:
+                return False
+
+            # 3) まずは get_characteristic で試す
+            try:
+                has_notify = svcs.get_characteristic(self.NOTIFY_CHARACTERISTIC_UUID) is not None
+                has_write  = svcs.get_characteristic(self.WRITE_CHARACTERISTIC_UUID)  is not None
+                if has_notify and has_write:
+                    return True
+            except Exception:
+                pass
+
+            # 4) ダメなら総当たりで UUID を大小無視で突き合わせ
+            try:
+                seen = set()
+                for svc in svcs:
+                    for ch in svc.characteristics:
+                        seen.add(str(ch.uuid).lower())
+                return (NEED_NOTIFY in seen) and (NEED_WRITE in seen)
+            except Exception:
+                return False
+
         try:
+            # 既接続なら送るだけ
+            if self.bluetooth_client and self.bluetooth_client.is_connected:
+                await self.bluetooth_send_message(message)
+                self.process_message_queue()
+                return
+
+            # スキャン（旧コードと同じ）
             devices = await BleakScanner.discover()
             if not devices:
                 print("No Bluetooth devices found.")
                 self.bluetooth_stop()
                 return
 
-            for device in devices:
-                uuids = getattr(device, "metadata", {}).get("uuids", []) or []
-                try_this = (SERVICE_UUID.lower() in [s.lower() for s in uuids]) or True 
+            # 優先順：前回成功アドレス → 名前一致 → 残り（最大15件）
+            last_addr = load_last_addr()
+            priority = []
 
-                if not try_this:
+            if last_addr:
+                for d in devices:
+                    if getattr(d, "address", None) == last_addr:
+                        priority.append(d)
+                        break
+
+            def _name_matches(dev_name: str) -> bool:
+                n = (dev_name or "").strip().lower()
+                if not n:
+                    return False
+                if n in ACCEPTED_NAMES:
+                    return True
+                return any(n.startswith(p) for p in ACCEPTED_PREFIXES)
+
+            for d in devices:
+                if d in priority:
                     continue
+                name = getattr(d, "name", "") or ""
+                if _name_matches(name):
+                    priority.append(d)
 
-                print(f"Connecting to: {device.name} ({device.address})")
+            for d in devices:
+                if d not in priority:
+                    priority.append(d)
+                if len(priority) >= 15:
+                    break
 
-                if self.bluetooth_client and self.bluetooth_client.is_connected:
-                    await self.bluetooth_send_message(message)
-                    return
-
-                client = BleakClient(device, timeout=35.0)
+            client = None
+            for i, dev in enumerate(priority):
+                print(f"Connecting to: {dev.name} ({dev.address})")
+                c = BleakClient(dev, timeout=(12.0 if i == 0 else 10.0))  # 1台目だけ少し余裕
                 try:
-                    await client.connect()
-                    await client.get_services()
+                    await c.connect()
 
-                    has_notify = client.services.get_characteristic(self.NOTIFY_CHARACTERISTIC_UUID) is not None
-                    has_write  = client.services.get_characteristic(self.WRITE_CHARACTERISTIC_UUID) is not None
-                    if not (has_notify and has_write):
-                        await client.disconnect()
+                    # ★ ここが肝：サービス反映待ち＋総当たりチェック
+                    if not await has_required_characteristics(c):
+                        print("Connected but target characteristics not found. Trying next candidate...")
+                        try:
+                            await c.disconnect()
+                        except Exception:
+                            pass
                         continue
 
-                    print("Successfully connected to Bluetooth.")
-                    self.bluetooth_client = client
-
-                    await client.start_notify(self.NOTIFY_CHARACTERISTIC_UUID, handle_notification)
-                    await asyncio.sleep(0.5)
-                    await self.bluetooth_send_message(message)
-
-                    self.process_message_queue()
+                    client = c
                     break
 
                 except Exception:
-                    self.bluetooth_stop()
-                    traceback.print_exc()
                     try:
-                        if client.is_connected:
-                            await client.disconnect()
-                    except:
+                        if c.is_connected:
+                            await c.disconnect()
+                    except Exception:
                         pass
-                    self.bluetooth_client = None
+                    continue
+
+            if not client:
+                print("No device with required characteristics.")
+                self.bluetooth_stop()
+                return
+
+            print("Successfully connected to Bluetooth.")
+            self.bluetooth_client = client
+            save_last_addr(client.address)
+
+            await client.start_notify(self.NOTIFY_CHARACTERISTIC_UUID, handle_notification)
+            await asyncio.sleep(0.5)
+            await self.bluetooth_send_message(message)
+            self.process_message_queue()
 
         except Exception:
             self.bluetooth_stop()
@@ -336,9 +434,14 @@ class ifm_and_fm_bluetooh_functions:
                 time.sleep(0.1)
 
             if self.bluetooth_client and self.bluetooth_client.is_connected:
+                from concurrent.futures import CancelledError as FuturesCancelledError
+
                 future = asyncio.run_coroutine_threadsafe(self.bluetooth_send_message(message), self.bluetooth_loop)
-                future.result(timeout=2.0)
-                print(f"Successfully sent message: {message}")
+                try:
+                    future.result(timeout=2.0)
+                    print(f"Successfully sent message: {message}")
+                except FuturesCancelledError:
+                    return  # 停止中のキャンセルは無視
             else:
                 print(f"Bluetooth not connected for message '{message}'. Queuing for later.")
 
@@ -376,15 +479,25 @@ class ifm_and_fm_bluetooh_functions:
                 future = asyncio.run_coroutine_threadsafe(self.bluetooth_recieve_realtime_start(message), loop)
                 future.result(timeout=30.0)
             else:
-                future = asyncio.run_coroutine_threadsafe(self.bluetooth_send_message(message), loop)
-                future.result(timeout=2.0)
+                from concurrent.futures import CancelledError as _Cancelled
 
-            if self.recive_bluetooth_Mode:
-                asyncio.run_coroutine_threadsafe(self.keep_bluetooth_alive(message), loop)
+                future = asyncio.run_coroutine_threadsafe(self.bluetooth_send_message(message), loop)
+                try:
+                    future.result(timeout=2.0)
+                except _Cancelled:
+                    # 停止処理中にキャンセルされた。無視して良い。
+                    return
 
         except Exception as e:
             print(f"Bluetooth loop error: {e}")
             traceback.print_exc()
+
+        if self.recive_bluetooth_Mode:
+            # 既存の keep-alive Future が無い、または終了済みなら新しく作成
+            if self.keepalive_future is None or self.keepalive_future.done():
+                self.keepalive_future = asyncio.run_coroutine_threadsafe(
+                    self.keep_bluetooth_alive(message), self.bluetooth_loop
+                )
 
     async def keep_bluetooth_alive(self, message):
         while self.recive_bluetooth_Mode:
@@ -394,54 +507,62 @@ class ifm_and_fm_bluetooh_functions:
 
     async def stop_async_tasks(self):
         try:
-            if self.bluetooth_loop:
-                if hasattr(self, 'scanning_task') and self.scanning_task:
-                    self.scanning_task.cancel()
-                    try:
-                        await self.scanning_task
-                    except asyncio.CancelledError:
-                        pass
-                    self.scanning_task = None
-
-                tasks = [t for t in asyncio.all_tasks(self.bluetooth_loop) if
-                            t is not asyncio.current_task(self.bluetooth_loop)]
-                for task in tasks:
-                    task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except:
+            # ここでは「自分が作ったタスク」だけを止める
+            if hasattr(self, 'scanning_task') and self.scanning_task:
+                self.scanning_task.cancel()
+                try:
+                    await self.scanning_task
+                except asyncio.CancelledError:
+                    pass
+                self.scanning_task = None
+        except Exception:
             pass
+
 
     async def stop_notifications_and_cleanup(self):
         try:
             if self.bluetooth_client and self.bluetooth_client.is_connected:
-                if hasattr(self, 'notify_char_handle') and self.notify_char_handle is not None:
-                    await self.bluetooth_client.stop_notify(self.notify_char_handle)
-                await self.bluetooth_client.disconnect()
+                try:
+                    await self.bluetooth_client.stop_notify(self.NOTIFY_CHARACTERISTIC_UUID)
+                except Exception:
+                    pass
+                try:
+                    await self.bluetooth_client.disconnect()
+                except Exception:
+                    pass
         except Exception as e:
             print(f"Error during cleanup: {e}")
-                    
+            
     def bluetooth_stop(self):
         try:
             self.recive_bluetooth_Mode = False
 
+            # 1) keep-alive の明示キャンセル
+            try:
+                if self.keepalive_future is not None:
+                    self.keepalive_future.cancel()
+                    self.keepalive_future = None
+            except Exception:
+                pass
+
             if self.bluetooth_loop and self.bluetooth_loop.is_running():
+                # 2) 自前タスクの停止（all_tasks は使わない）
                 try:
                     future = asyncio.run_coroutine_threadsafe(self.stop_async_tasks(), self.bluetooth_loop)
                     future.result(timeout=5.0)
-                except TimeoutError:
-                    print("Timeout stopping async tasks.")
                 except Exception as e:
                     print(f"Error stopping async tasks: {e}")
                     traceback.print_exc()
+
+                # 3) 通知停止 → 切断（Bleak の内部コールバックが完了できるよう先に切る）
                 try:
                     future = asyncio.run_coroutine_threadsafe(self.stop_notifications_and_cleanup(), self.bluetooth_loop)
-                    future.result(timeout=5.0) 
-                except TimeoutError:
-                    print("Timeout stopping notifications and cleanup.")
+                    future.result(timeout=5.0)
                 except Exception as e:
                     print(f"Error stopping notifications and cleanup: {e}")
                     traceback.print_exc()
 
+                # 4) 最後に loop を止める
                 try:
                     self.bluetooth_loop.call_soon_threadsafe(self.bluetooth_loop.stop)
                     start_time = time.time()
@@ -450,7 +571,7 @@ class ifm_and_fm_bluetooh_functions:
                             print("Bluetooth loop stop timeout")
                             break
                         time.sleep(0.1)
-                except:
+                except Exception:
                     traceback.print_exc()
 
             if self.bluetooth_thread and self.bluetooth_thread.is_alive():
