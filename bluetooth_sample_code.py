@@ -36,13 +36,11 @@ class ifm_and_fm_bluetooh_functions:
         self.bluetooth_message_queue = queue.Queue()
         self.bluetooth_thread = None
         self.bluetooth_client = None
-        self.connect_button_default_background_color = None
         self.connection_mode = "realtime"
         self.bluetooth_message = queue.Queue(maxsize=200)
         self.bluetooth_loop = None
         self.connect_startTime = None
         self.recive_bluetooth_Mode = False
-        self.wifi_recieve_counter = False
         self.bluetooth_thread_lock = threading.Lock()
         self.encode_data_size = None
         self.bluetooth_received_data = bytearray()
@@ -639,3 +637,4 @@ if __name__ == "__main__":
 
     #stop bluetooth------------------------------------------------------------------
     bluetooth_instance.bluetooth_stop()
+
